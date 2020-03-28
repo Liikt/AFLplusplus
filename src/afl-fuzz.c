@@ -1235,6 +1235,13 @@ int main(int argc, char **argv_orig, char **envp) {
       afl_state_t *new_state = malloc(sizeof(afl_state_t));
       memcpy(new_state, afl, sizeof(afl_state_t));
       new_state->_id += i;
+      char id[5];
+
+      if (!afl->fixed_seed)
+        new_state->init_seed = tv.tv_sec ^ tv.tv_usec ^ (getpid() + i);
+
+      snprintf(id, 5, "%d", i);
+      new_state->out_dir = alloc_printf("%s/%s", afl->out_dir, id);
 
       main_env_t *env = malloc(sizeof(main_env_t));
       env->argc = argc;

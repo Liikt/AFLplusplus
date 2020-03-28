@@ -177,6 +177,8 @@ ifeq "$(TEST_MMAP)" "1"
 	LDFLAGS+=-Wno-deprecated-declarations
 endif
 
+LDFLAGS  += -lpthread
+
 all:	test_x86 test_shm test_python ready $(PROGS) afl-as test_build all_done
 
 man:    $(MANPAGES) 
