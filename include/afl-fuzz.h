@@ -504,6 +504,8 @@ typedef struct afl_state {
 
   u32 syncing_case;                     /* Syncing with case #...           */
 
+  u64 thread_count;                     /* Number of threads to fuzz with   */
+
   s32 stage_cur_byte,                   /* Byte offset of current stage op  */
       stage_cur_val;                    /* Value used for stage op          */
 
@@ -584,6 +586,19 @@ typedef struct afl_state {
   u8 first_trace[MAP_SIZE];
 
 } afl_state_t;
+
+typedef struct main_env {
+
+  afl_state_t *afl;
+
+  u8      exit_1;
+  u8 *extras_dir;
+  u8        argc;
+
+  char **argv;
+
+} main_env_t;
+
 
 /* A global pointer to all instances is needed (for now) for signals to arrive
  */

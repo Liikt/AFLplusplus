@@ -24,6 +24,7 @@
  */
 
 #include "afl-fuzz.h"
+#include <pthread.h>
 
 u8 be_quiet = 0;
 
@@ -222,16 +223,364 @@ static int stricmp(char const *a, char const *b) {
 
 }
 
+void *do_fuzz(void *env_void) {
+
+  u64    prev_queued = 0;
+  u32    sync_interval_cnt = 0, seek_to = 0;
+
+  char   **use_argv;
+
+  main_env_t *env = (main_env_t *)env_void;
+
+  afl_state_t *afl = env->afl;
+  u8 exit_1 = env->exit_1;
+  u8 *extras_dir = env->extras_dir;
+  u8 argc = env->argc;
+  char **argv = env->argv;
+
+
+  get_core_count(afl);
+
+#ifdef HAVE_AFFINITY
+  bind_to_free_cpu(afl);
+#endif                                                     /* HAVE_AFFINITY */
+
+  check_crash_handling();
+  check_cpu_governor(afl);
+
+  afl->fsrv.trace_bits = afl_shm_init(&afl->shm, MAP_SIZE, afl->dumb_mode);
+
+  setup_post(afl);
+
+  if (!afl->in_bitmap) memset(afl->virgin_bits, 255, MAP_SIZE);
+  memset(afl->virgin_tmout, 255, MAP_SIZE);
+  memset(afl->virgin_crash, 255, MAP_SIZE);
+
+  init_count_class16();
+
+  setup_dirs_fds(afl);
+
+  setup_custom_mutator(afl);
+
+  setup_cmdline_file(afl, argv + optind);
+
+  read_testcases(afl);
+  load_auto(afl);
+
+  pivot_inputs(afl);
+
+  if (extras_dir) load_extras(afl, extras_dir);
+
+  if (!afl->timeout_given) find_timeout(afl);
+
+  if ((afl->tmp_dir = afl->afl_env.afl_tmpdir) != NULL &&
+      !afl->in_place_resume) {
+
+    char tmpfile[afl->file_extension ? strlen(afl->tmp_dir) + 1 + 10 + 1 +
+                                           strlen(afl->file_extension) + 1
+                                     : strlen(afl->tmp_dir) + 1 + 10 + 1];
+    if (afl->file_extension) {
+
+      sprintf(tmpfile, "%s/.cur_input.%s", afl->tmp_dir, afl->file_extension);
+
+    } else {
+
+      sprintf(tmpfile, "%s/.cur_input", afl->tmp_dir);
+
+    }
+
+    if (access(tmpfile, F_OK) !=
+        -1)  // there is still a race condition here, but well ...
+      FATAL(
+          "AFL_TMPDIR already has an existing temporary input file: %s - if "
+          "this is not from another instance, then just remove the file.",
+          tmpfile);
+
+  } else
+
+    afl->tmp_dir = afl->out_dir;
+
+  /* If we don't have a file name chosen yet, use a safe default. */
+
+  if (!afl->fsrv.out_file) {
+
+    u32 i = optind + 1;
+    while (argv[i]) {
+
+      u8 *aa_loc = strstr(argv[i], "@@");
+
+      if (aa_loc && !afl->fsrv.out_file) {
+
+        afl->fsrv.use_stdin = 0;
+
+        if (afl->file_extension) {
+
+          afl->fsrv.out_file = alloc_printf("%s/.cur_input.%s", afl->tmp_dir,
+                                            afl->file_extension);
+
+        } else {
+
+          afl->fsrv.out_file = alloc_printf("%s/.cur_input", afl->tmp_dir);
+
+        }
+
+        detect_file_args(argv + optind + 1, afl->fsrv.out_file,
+                         &afl->fsrv.use_stdin);
+        break;
+
+      }
+
+      ++i;
+
+    }
+
+  }
+
+  if (!afl->fsrv.out_file) setup_stdio_file(afl);
+
+  if (afl->cmplog_binary) {
+
+    if (afl->limit_time_sig)
+      FATAL(
+          "MOpt and CmpLog are mutually exclusive. We accept pull requests "
+          "that integrates MOpt with the optional mutators "
+          "(custom/radamsa/redquenn/...).");
+
+    if (afl->unicorn_mode)
+      FATAL("CmpLog and Unicorn mode are not compatible at the moment, sorry");
+    if (!afl->qemu_mode) check_binary(afl, afl->cmplog_binary);
+
+  }
+
+  check_binary(afl, argv[optind]);
+
+  afl->start_time = get_cur_time();
+
+  if (afl->qemu_mode) {
+
+    if (afl->use_wine)
+      use_argv = get_wine_argv(argv[0], &afl->fsrv.target_path, argc - optind,
+                               argv + optind);
+    else
+      use_argv = get_qemu_argv(argv[0], &afl->fsrv.target_path, argc - optind,
+                               argv + optind);
+
+  } else {
+
+    use_argv = argv + optind;
+
+  }
+
+  afl->argv = use_argv;
+  perform_dry_run(afl);
+
+  cull_queue(afl);
+
+  show_init_stats(afl);
+
+  seek_to = find_start_position(afl);
+
+  write_stats_file(afl, 0, 0, 0);
+  maybe_update_plot_file(afl, 0, 0);
+  save_auto(afl);
+
+  if (afl->stop_soon) goto stop_fuzzing;
+
+  /* Woop woop woop */
+
+  if (!afl->not_on_tty) {
+
+    sleep(4);
+    afl->start_time += 4000;
+    if (afl->stop_soon) goto stop_fuzzing;
+
+  }
+
+  // real start time, we reset, so this works correctly with -V
+  afl->start_time = get_cur_time();
+
+  while (1) {
+
+    u8 skipped_fuzz;
+
+    cull_queue(afl);
+
+    if (!afl->queue_cur) {
+
+      ++afl->queue_cycle;
+      afl->current_entry = 0;
+      afl->cur_skipped_paths = 0;
+      afl->queue_cur = afl->queue;
+
+      while (seek_to) {
+
+        ++afl->current_entry;
+        --seek_to;
+        afl->queue_cur = afl->queue_cur->next;
+
+      }
+
+      // show_stats(afl);
+
+      if (unlikely(afl->not_on_tty)) {
+
+        ACTF("Entering queue cycle %llu.", afl->queue_cycle);
+        fflush(stdout);
+
+      }
+
+      /* If we had a full queue cycle with no new finds, try
+         recombination strategies next. */
+
+      if (afl->queued_paths == prev_queued) {
+
+        if (afl->use_splicing)
+          ++afl->cycles_wo_finds;
+        else
+          afl->use_splicing = 1;
+
+      } else
+
+        afl->cycles_wo_finds = 0;
+
+      prev_queued = afl->queued_paths;
+
+      if (afl->sync_id && afl->queue_cycle == 1 &&
+          afl->afl_env.afl_import_first)
+        sync_fuzzers(afl);
+
+    }
+
+    skipped_fuzz = fuzz_one(afl);
+
+    if (!skipped_fuzz && !afl->stop_soon && afl->sync_id) {
+
+      if (!(sync_interval_cnt++ % SYNC_INTERVAL)) sync_fuzzers(afl);
+
+    }
+
+    if (!afl->stop_soon && exit_1) afl->stop_soon = 2;
+
+    if (afl->stop_soon) break;
+
+    afl->queue_cur = afl->queue_cur->next;
+    ++afl->current_entry;
+
+    if (afl->most_time_key == 1) {
+
+      u64 cur_ms_lv = get_cur_time();
+      if (afl->most_time * 1000 < cur_ms_lv - afl->start_time) {
+
+        afl->most_time_key = 2;
+        afl->stop_soon = 2;
+        break;
+
+      }
+
+    }
+
+    if (afl->most_execs_key == 1) {
+
+      if (afl->most_execs <= afl->total_execs) {
+
+        afl->most_execs_key = 2;
+        afl->stop_soon = 2;
+        break;
+
+      }
+
+    }
+
+  }
+
+  // if (afl->queue_cur) show_stats(afl);
+
+  /*
+   * ATTENTION - the following 10 lines were copied from a PR to Google's afl
+   * repository - and slightly fixed.
+   * These lines have nothing to do with the purpose of original PR though.
+   * Looks like when an exit condition was completed (AFL_BENCH_JUST_ONE,
+   * AFL_EXIT_WHEN_DONE or AFL_BENCH_UNTIL_CRASH) the child and forkserver
+   * where not killed?
+   */
+  /* if we stopped programmatically, we kill the forkserver and the current
+     runner. if we stopped manually, this is done by the signal handler */
+  if (afl->stop_soon == 2) {
+
+    if (afl->fsrv.child_pid > 0) kill(afl->fsrv.child_pid, SIGKILL);
+    if (afl->fsrv.fsrv_pid > 0) kill(afl->fsrv.fsrv_pid, SIGKILL);
+    if (afl->cmplog_child_pid > 0) kill(afl->cmplog_child_pid, SIGKILL);
+    if (afl->cmplog_fsrv_pid > 0) kill(afl->cmplog_fsrv_pid, SIGKILL);
+    /* Now that we've killed the forkserver, we wait for it to be able to get
+     * rusage stats. */
+    if (waitpid(afl->fsrv.fsrv_pid, NULL, 0) <= 0) { WARNF("error waitpid\n"); }
+
+  }
+
+  write_bitmap(afl);
+  maybe_update_plot_file(afl, 0, 0);
+  save_auto(afl);
+
+stop_fuzzing:
+
+  write_stats_file(afl, 0, 0, 0);
+  afl->force_ui_update = 1;  // ensure the screen is reprinted
+  show_stats(afl);           // print the screen one last time
+
+  SAYF(CURSOR_SHOW cLRD "\n\n+++ Testing aborted %s +++\n" cRST,
+       afl->stop_soon == 2 ? "programmatically" : "by user");
+
+  if (afl->most_time_key == 2)
+    SAYF(cYEL "[!] " cRST "Time limit was reached\n");
+  if (afl->most_execs_key == 2)
+    SAYF(cYEL "[!] " cRST "Execution limit was reached\n");
+
+  /* Running for more than 30 minutes but still doing first cycle? */
+
+  if (afl->queue_cycle == 1 &&
+      get_cur_time() - afl->start_time > 30 * 60 * 1000) {
+
+    SAYF("\n" cYEL "[!] " cRST
+         "Stopped during the first cycle, results may be incomplete.\n"
+         "    (For info on resuming, see %s/README.md)\n",
+         doc_path);
+
+  }
+
+  fclose(afl->fsrv.plot_file);
+  destroy_queue(afl);
+  destroy_extras(afl);
+  destroy_custom_mutator(afl);
+  afl_shm_deinit(&afl->shm);
+  afl_fsrv_deinit(&afl->fsrv);
+  if (afl->orig_cmdline) ck_free(afl->orig_cmdline);
+  ck_free(afl->fsrv.target_path);
+  ck_free(afl->fsrv.out_file);
+  ck_free(afl->sync_id);
+  free(afl);                                                 /* not tracked */
+
+  argv_cpy_free(argv);
+
+  alloc_report();
+
+  OKF("We're done here. Have a nice day!\n");
+
+  // exit(0);
+  return NULL;
+
+}
+
+
 /* Main entry point */
 
 int main(int argc, char **argv_orig, char **envp) {
 
   s32    opt;
-  u64    prev_queued = 0;
-  u32    sync_interval_cnt = 0, seek_to, show_help = 0;
-  u8 *   extras_dir = 0;
+  u32    show_help = 0;
   u8     mem_limit_given = 0, exit_1 = 0;
-  char **use_argv;
+  u8    *extras_dir = 0;
+
+  pthread_t *threads;
 
   struct timeval  tv;
   struct timezone tz;
@@ -256,9 +605,18 @@ int main(int argc, char **argv_orig, char **envp) {
   afl->init_seed = tv.tv_sec ^ tv.tv_usec ^ getpid();
 
   while ((opt = getopt(argc, argv,
-                       "+c:i:I:o:f:m:t:T:dnCB:S:M:x:QNUWe:p:s:V:E:L:hRP:")) > 0)
+                       "+c:i:I:o:f:m:t:T:dnCB:S:M:x:QNUWe:p:s:V:E:L:hRP:a:")) > 0)
 
     switch (opt) {
+
+      case 'a': {
+
+        afl->thread_count = strtoul(optarg, 0L, 10); 
+        threads = malloc(afl->thread_count * sizeof(pthread_t));
+        SAYF(cGRN "[+]" cRST " Fuzzing with %lld threads!\n", afl->thread_count);
+        break;
+
+      }
 
       case 'I': afl->infoexec = optarg; break;
 
@@ -870,333 +1228,54 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  get_core_count(afl);
+  if (afl->thread_count > 1 && threads != NULL) {
 
-#ifdef HAVE_AFFINITY
-  bind_to_free_cpu(afl);
-#endif                                                     /* HAVE_AFFINITY */
+    for (int i = 0; i < afl->thread_count; i++) {
 
-  check_crash_handling();
-  check_cpu_governor(afl);
+      afl_state_t *new_state = malloc(sizeof(afl_state_t));
+      memcpy(new_state, afl, sizeof(afl_state_t));
+      new_state->_id += i;
 
-  afl->fsrv.trace_bits = afl_shm_init(&afl->shm, MAP_SIZE, afl->dumb_mode);
+      main_env_t *env = malloc(sizeof(main_env_t));
+      env->argc = argc;
+      env->argv = argv;
+      env->exit_1 = exit_1;
+      env->extras_dir = extras_dir;
+      env->afl = new_state;
 
-  setup_post(afl);
-
-  if (!afl->in_bitmap) memset(afl->virgin_bits, 255, MAP_SIZE);
-  memset(afl->virgin_tmout, 255, MAP_SIZE);
-  memset(afl->virgin_crash, 255, MAP_SIZE);
-
-  init_count_class16();
-
-  setup_dirs_fds(afl);
-
-  setup_custom_mutator(afl);
-
-  setup_cmdline_file(afl, argv + optind);
-
-  read_testcases(afl);
-  load_auto(afl);
-
-  pivot_inputs(afl);
-
-  if (extras_dir) load_extras(afl, extras_dir);
-
-  if (!afl->timeout_given) find_timeout(afl);
-
-  if ((afl->tmp_dir = afl->afl_env.afl_tmpdir) != NULL &&
-      !afl->in_place_resume) {
-
-    char tmpfile[afl->file_extension ? strlen(afl->tmp_dir) + 1 + 10 + 1 +
-                                           strlen(afl->file_extension) + 1
-                                     : strlen(afl->tmp_dir) + 1 + 10 + 1];
-    if (afl->file_extension) {
-
-      sprintf(tmpfile, "%s/.cur_input.%s", afl->tmp_dir, afl->file_extension);
-
-    } else {
-
-      sprintf(tmpfile, "%s/.cur_input", afl->tmp_dir);
-
-    }
-
-    if (access(tmpfile, F_OK) !=
-        -1)  // there is still a race condition here, but well ...
-      FATAL(
-          "AFL_TMPDIR already has an existing temporary input file: %s - if "
-          "this is not from another instance, then just remove the file.",
-          tmpfile);
-
-  } else
-
-    afl->tmp_dir = afl->out_dir;
-
-  /* If we don't have a file name chosen yet, use a safe default. */
-
-  if (!afl->fsrv.out_file) {
-
-    u32 i = optind + 1;
-    while (argv[i]) {
-
-      u8 *aa_loc = strstr(argv[i], "@@");
-
-      if (aa_loc && !afl->fsrv.out_file) {
-
-        afl->fsrv.use_stdin = 0;
-
-        if (afl->file_extension) {
-
-          afl->fsrv.out_file = alloc_printf("%s/.cur_input.%s", afl->tmp_dir,
-                                            afl->file_extension);
-
-        } else {
-
-          afl->fsrv.out_file = alloc_printf("%s/.cur_input", afl->tmp_dir);
-
-        }
-
-        detect_file_args(argv + optind + 1, afl->fsrv.out_file,
-                         &afl->fsrv.use_stdin);
-        break;
-
+      if(new_state == NULL){
+        FATAL("Couldn't alloc a new state!");
       }
 
-      ++i;
+      if (pthread_create(&threads[i], 0, do_fuzz, env)) {
+        FATAL("Couldn't create a new thread");
+      }
 
     }
 
-  }
+    for (int i = 0; i < afl->thread_count; i++) {
 
-  if (!afl->fsrv.out_file) setup_stdio_file(afl);
+      pthread_join(threads[i], 0);
 
-  if (afl->cmplog_binary) {
+    }
 
-    if (afl->limit_time_sig)
-      FATAL(
-          "MOpt and CmpLog are mutually exclusive. We accept pull requests "
-          "that integrates MOpt with the optional mutators "
-          "(custom/radamsa/redquenn/...).");
+    free(threads);
 
-    if (afl->unicorn_mode)
-      FATAL("CmpLog and Unicorn mode are not compatible at the moment, sorry");
-    if (!afl->qemu_mode) check_binary(afl, afl->cmplog_binary);
+  } else if (afl->thread_count > 1 && threads == NULL) {
 
-  }
-
-  check_binary(afl, argv[optind]);
-
-  afl->start_time = get_cur_time();
-
-  if (afl->qemu_mode) {
-
-    if (afl->use_wine)
-      use_argv = get_wine_argv(argv[0], &afl->fsrv.target_path, argc - optind,
-                               argv + optind);
-    else
-      use_argv = get_qemu_argv(argv[0], &afl->fsrv.target_path, argc - optind,
-                               argv + optind);
+    FATAL("Error creating the threads array");
 
   } else {
 
-    use_argv = argv + optind;
+    main_env_t *env = malloc(sizeof(main_env_t));
+    env->argc = argc;
+    env->argv = argv;
+    env->exit_1 = exit_1;
+    env->extras_dir = extras_dir;
+    env->afl = afl;
+    do_fuzz(env);
 
   }
-
-  afl->argv = use_argv;
-  perform_dry_run(afl);
-
-  cull_queue(afl);
-
-  show_init_stats(afl);
-
-  seek_to = find_start_position(afl);
-
-  write_stats_file(afl, 0, 0, 0);
-  maybe_update_plot_file(afl, 0, 0);
-  save_auto(afl);
-
-  if (afl->stop_soon) goto stop_fuzzing;
-
-  /* Woop woop woop */
-
-  if (!afl->not_on_tty) {
-
-    sleep(4);
-    afl->start_time += 4000;
-    if (afl->stop_soon) goto stop_fuzzing;
-
-  }
-
-  // real start time, we reset, so this works correctly with -V
-  afl->start_time = get_cur_time();
-
-  while (1) {
-
-    u8 skipped_fuzz;
-
-    cull_queue(afl);
-
-    if (!afl->queue_cur) {
-
-      ++afl->queue_cycle;
-      afl->current_entry = 0;
-      afl->cur_skipped_paths = 0;
-      afl->queue_cur = afl->queue;
-
-      while (seek_to) {
-
-        ++afl->current_entry;
-        --seek_to;
-        afl->queue_cur = afl->queue_cur->next;
-
-      }
-
-      // show_stats(afl);
-
-      if (unlikely(afl->not_on_tty)) {
-
-        ACTF("Entering queue cycle %llu.", afl->queue_cycle);
-        fflush(stdout);
-
-      }
-
-      /* If we had a full queue cycle with no new finds, try
-         recombination strategies next. */
-
-      if (afl->queued_paths == prev_queued) {
-
-        if (afl->use_splicing)
-          ++afl->cycles_wo_finds;
-        else
-          afl->use_splicing = 1;
-
-      } else
-
-        afl->cycles_wo_finds = 0;
-
-      prev_queued = afl->queued_paths;
-
-      if (afl->sync_id && afl->queue_cycle == 1 &&
-          afl->afl_env.afl_import_first)
-        sync_fuzzers(afl);
-
-    }
-
-    skipped_fuzz = fuzz_one(afl);
-
-    if (!skipped_fuzz && !afl->stop_soon && afl->sync_id) {
-
-      if (!(sync_interval_cnt++ % SYNC_INTERVAL)) sync_fuzzers(afl);
-
-    }
-
-    if (!afl->stop_soon && exit_1) afl->stop_soon = 2;
-
-    if (afl->stop_soon) break;
-
-    afl->queue_cur = afl->queue_cur->next;
-    ++afl->current_entry;
-
-    if (afl->most_time_key == 1) {
-
-      u64 cur_ms_lv = get_cur_time();
-      if (afl->most_time * 1000 < cur_ms_lv - afl->start_time) {
-
-        afl->most_time_key = 2;
-        afl->stop_soon = 2;
-        break;
-
-      }
-
-    }
-
-    if (afl->most_execs_key == 1) {
-
-      if (afl->most_execs <= afl->total_execs) {
-
-        afl->most_execs_key = 2;
-        afl->stop_soon = 2;
-        break;
-
-      }
-
-    }
-
-  }
-
-  // if (afl->queue_cur) show_stats(afl);
-
-  /*
-   * ATTENTION - the following 10 lines were copied from a PR to Google's afl
-   * repository - and slightly fixed.
-   * These lines have nothing to do with the purpose of original PR though.
-   * Looks like when an exit condition was completed (AFL_BENCH_JUST_ONE,
-   * AFL_EXIT_WHEN_DONE or AFL_BENCH_UNTIL_CRASH) the child and forkserver
-   * where not killed?
-   */
-  /* if we stopped programmatically, we kill the forkserver and the current
-     runner. if we stopped manually, this is done by the signal handler */
-  if (afl->stop_soon == 2) {
-
-    if (afl->fsrv.child_pid > 0) kill(afl->fsrv.child_pid, SIGKILL);
-    if (afl->fsrv.fsrv_pid > 0) kill(afl->fsrv.fsrv_pid, SIGKILL);
-    if (afl->cmplog_child_pid > 0) kill(afl->cmplog_child_pid, SIGKILL);
-    if (afl->cmplog_fsrv_pid > 0) kill(afl->cmplog_fsrv_pid, SIGKILL);
-    /* Now that we've killed the forkserver, we wait for it to be able to get
-     * rusage stats. */
-    if (waitpid(afl->fsrv.fsrv_pid, NULL, 0) <= 0) { WARNF("error waitpid\n"); }
-
-  }
-
-  write_bitmap(afl);
-  maybe_update_plot_file(afl, 0, 0);
-  save_auto(afl);
-
-stop_fuzzing:
-
-  write_stats_file(afl, 0, 0, 0);
-  afl->force_ui_update = 1;  // ensure the screen is reprinted
-  show_stats(afl);           // print the screen one last time
-
-  SAYF(CURSOR_SHOW cLRD "\n\n+++ Testing aborted %s +++\n" cRST,
-       afl->stop_soon == 2 ? "programmatically" : "by user");
-
-  if (afl->most_time_key == 2)
-    SAYF(cYEL "[!] " cRST "Time limit was reached\n");
-  if (afl->most_execs_key == 2)
-    SAYF(cYEL "[!] " cRST "Execution limit was reached\n");
-
-  /* Running for more than 30 minutes but still doing first cycle? */
-
-  if (afl->queue_cycle == 1 &&
-      get_cur_time() - afl->start_time > 30 * 60 * 1000) {
-
-    SAYF("\n" cYEL "[!] " cRST
-         "Stopped during the first cycle, results may be incomplete.\n"
-         "    (For info on resuming, see %s/README.md)\n",
-         doc_path);
-
-  }
-
-  fclose(afl->fsrv.plot_file);
-  destroy_queue(afl);
-  destroy_extras(afl);
-  destroy_custom_mutator(afl);
-  afl_shm_deinit(&afl->shm);
-  afl_fsrv_deinit(&afl->fsrv);
-  if (afl->orig_cmdline) ck_free(afl->orig_cmdline);
-  ck_free(afl->fsrv.target_path);
-  ck_free(afl->fsrv.out_file);
-  ck_free(afl->sync_id);
-  free(afl);                                                 /* not tracked */
-
-  argv_cpy_free(argv);
-
-  alloc_report();
-
-  OKF("We're done here. Have a nice day!\n");
-
-  exit(0);
 
 }
 

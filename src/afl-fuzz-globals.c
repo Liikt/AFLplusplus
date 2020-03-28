@@ -140,6 +140,8 @@ void afl_state_init(afl_state_t *afl) {
   afl->stats_last_execs = 0;
   afl->stats_avg_exec = -1;
 
+  afl->thread_count = 1;
+
   init_mopt_globals(afl);
 
   list_append(&afl_states, afl);

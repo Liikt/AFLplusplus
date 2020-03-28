@@ -2086,6 +2086,8 @@ void check_if_tty(afl_state_t *afl) {
 
   struct winsize ws;
 
+  afl->afl_env.afl_no_ui = 1;
+
   if (afl->afl_env.afl_no_ui) {
 
     OKF("Disabling the UI because AFL_NO_UI is set.");
